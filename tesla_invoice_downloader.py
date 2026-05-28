@@ -795,6 +795,13 @@ class MoneybirdUploader:
                 logger.error(f"Moneybird streaming upload failed for session {rec.get('sessionId')}: {e}")
 
 
+def applySinceDays(args_ns: argparse.Namespace) -> None:
+    """If --since-days is set, refresh args_ns.on_or_after to today - N days (YYYYMMDD)."""
+    if args_ns.since_days is not None:
+        cutoff = datetime.date.today() - datetime.timedelta(days=args_ns.since_days)
+        args_ns.on_or_after = cutoff.strftime("%Y%m%d")
+
+
 def resolveMoneybirdConfig(args_ns: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, Optional[str]]:
     """Resolve Moneybird token + admin_id from CLI flags, falling back to the config defaults."""
     defaults = config.get("moneybird", {}).get("defaults", {})
@@ -919,6 +926,7 @@ def main(args_in: argparse.Namespace) -> None:
         daemonize()
         downloader = TeslaInvoiceDownloader(interactive=False)
         while True:
+            applySinceDays(args)
             accessToken = downloader.authenticate()
             baseUrl = getBaseUrlForRegion(downloader.config.get("region", "NA"))
             records = downloader.fetchChargingHistory(baseUrl, accessToken, vin=args.vin)
@@ -932,6 +940,7 @@ def main(args_in: argparse.Namespace) -> None:
             logger.info("Cycle complete. Sleeping for one hour...")
             time.sleep(3600)
     else:
+        applySinceDays(args)
         downloader = TeslaInvoiceDownloader(interactive=True)
         accessToken = downloader.authenticate()
         baseUrl = getBaseUrlForRegion(downloader.config.get("region", "NA"))
@@ -956,7 +965,10 @@ if __name__ == "__main__":
     parser.add_argument("--log-file", help="File to write logs to", default=None)
     parser.add_argument("--daemon", action="store_true", help="Daemonise the process to run in the background")
     parser.add_argument("--force-auth", action="store_true", help="Redo the authenication to get new tokens")
-    parser.add_argument("--on-or-after", help="Only download invoices on or after this date (YYYYMMDD format)", default=None)
+    dateFilterGroup = parser.add_mutually_exclusive_group()
+    dateFilterGroup.add_argument("--on-or-after", help="Only download invoices on or after this date (YYYYMMDD format)", default=None)
+    dateFilterGroup.add_argument("--since-days", type=int, default=None,
+                                 help="Only download invoices from the last N days. Computed relative to today at run time (and each cycle in --daemon mode). Mutually exclusive with --on-or-after.")
     parser.add_argument("--moneybird-token", help="Moneybird personal API token. When set (here or in config), invoices are also uploaded into the Moneybird Documenten inbox as typeless documents.", default=None)
     parser.add_argument("--moneybird-admin-id", help="Moneybird administration ID to upload into.", default=None)
     parser.add_argument("--moneybird-list-config", action="store_true", help="List the administrations available to --moneybird-token, then exit.")
@@ -968,4 +980,6 @@ if __name__ == "__main__":
             datetime.datetime.strptime(args.on_or_after, "%Y%m%d")
         except ValueError:
             parser.error("--on-or-after must be in YYYYMMDD format.")
+    if args.since_days is not None and args.since_days < 0:
+        parser.error("--since-days must be a non-negative integer.")
     main(args)

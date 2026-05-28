@@ -13,12 +13,12 @@ Only runtime dependency is `requests` (no `requirements.txt`, no test suite, no 
 ```sh
 pip install requests
 python tesla_invoice_downloader.py [--vin VIN] [--output-dir DIR] [--log-file FILE] \
-    [--daemon] [--force-auth] [--on-or-after YYYYMMDD] [--debug] \
+    [--daemon] [--force-auth] [--on-or-after YYYYMMDD | --since-days N] [--debug] \
     [--moneybird-token TOKEN --moneybird-admin-id ID] \
     [--moneybird-list-config | --moneybird-setup]
 ```
 
-`--daemon` uses the Unix double-fork pattern, so it will not work on Windows. `--on-or-after` is validated as `YYYYMMDD` at arg-parse time.
+`--daemon` uses the Unix double-fork pattern, so it will not work on Windows. `--on-or-after` is validated as `YYYYMMDD` at arg-parse time. `--since-days N` is a relative alternative that resolves to `--on-or-after` at run time (and is re-resolved at the top of every `--daemon` cycle via `applySinceDays`, so a long-running daemon's window slides forward instead of freezing); the two flags are in an argparse mutually exclusive group.
 
 `--output-dir` is **optional**. If set, behaviour is "download to disk, then upload to Moneybird if configured". If omitted, the script runs in **streaming mode**: it requires Moneybird credentials and pushes PDFs straight from Tesla to Moneybird without ever writing to disk (the `.json` sidecar is also skipped). At least one of `--output-dir` or Moneybird credentials must be present; `main()` exits non-zero with a clear error otherwise.
 
