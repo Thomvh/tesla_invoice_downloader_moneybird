@@ -18,6 +18,7 @@ This project is licensed under the **GNU General Public License v3 (GPLv3)**. Se
 - Only retrieves invoices since the last saved charge session
 - Saves metadata alongside invoices in JSON format
 - Daemon mode: checks for new invoices every hour
+- Optional Moneybird upload: pushes each invoice into Moneybird's Documenten inbox and lets Moneybird's OCR fill in the details, so the bookkeeper can convert it to a purchase invoice with the correct regional Tesla supplier
 - Configurable output directory and logging
 
 ## Installation
@@ -25,10 +26,23 @@ This project is licensed under the **GNU General Public License v3 (GPLv3)**. Se
 ### Prerequisites
 
 - Python 3.7+
-- Install dependencies:
-  ```sh
-  pip install requests
-  ```
+- A Tesla Developer application (created in [Running daily — Step 0](#step-0--create-a-tesla-developer-app))
+- Optional: a Moneybird personal API token if you want invoices uploaded automatically
+
+### Install in a virtual environment
+
+Clone the repo, create a venv inside it, and install the single dependency:
+
+```sh
+git clone https://github.com/Thomvh/tesla_invoice_downloader_moneybird.git
+cd tesla_invoice_downloader_moneybird
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install requests
+```
+
+From here on, every command in this README assumes the venv is active (`source .venv/bin/activate`). To leave the venv: `deactivate`.
 
 ## Usage
 
@@ -40,13 +54,18 @@ python tesla_invoice_downloader.py [OPTIONS]
 
 ### Command-line Arguments
 
-| Option             | Description |
-|--------------------|-------------|
-| `--vin VIN`       | Restrict invoices to a specific VIN |
-| `--output-dir DIR`| Directory to save invoices (default: current directory) |
-| `--log-file FILE` | File to save logs (optional) |
-| `--daemon`        | Run as a background process, checking for new invoices every hour |
-| `--debug`         | Enable debug logging |
+| Option                       | Description |
+|------------------------------|-------------|
+| `--vin VIN`                  | Restrict invoices to a specific VIN |
+| `--output-dir DIR`           | Directory to save invoices. Omit to enable streaming mode (no PDFs on disk — requires Moneybird credentials). |
+| `--log-file FILE`            | File to save logs (optional) |
+| `--daemon`                   | Run as a background process, checking for new invoices every hour |
+| `--on-or-after YYYYMMDD`     | Only download invoices on or after the given date |
+| `--moneybird-token TOKEN`    | Moneybird personal API token. Enables uploading each downloaded invoice into the Moneybird Documenten inbox |
+| `--moneybird-admin-id ID`    | Moneybird administration ID to upload into |
+| `--moneybird-list-config`    | List administrations available to `--moneybird-token`, then exit |
+| `--moneybird-setup`          | Interactively save Moneybird token + administration into the config file, then exit |
+| `--debug`                    | Enable debug logging |
 
 ### Example Usage
 
@@ -65,19 +84,114 @@ python tesla_invoice_downloader.py [OPTIONS]
    python tesla_invoice_downloader.py --daemon --output-dir ~/invoices --log-file ~/logs/invoice.log
    ```
 
-## Tesla Developer Setup
+## Running daily
 
-Before using the script, create a Tesla Developer app:
+Once installed, the recommended deployment is a daily cron job that downloads any new invoices (and optionally uploads them to Moneybird).
 
-1. Go to [Tesla Developer Portal](https://developer.tesla.com/)
-2. Click **"Get Started"** and create an application with the following settings:
-   - **Application Name:** (Cannot contain "Tesla")
-   - **OAuth Grant Type:** Authorization Code and Machine-to-Machine
+### Step 0 — Create a Tesla Developer app
+
+Skip if you already have a Client ID + Client Secret. Otherwise:
+
+1. Go to <https://developer.tesla.com/> and click **Get Started**.
+2. Create an application with:
+   - **Application Name:** anything that does not contain "Tesla"
+   - **OAuth Grant Type:** *Authorization Code and Machine-to-Machine*
    - **Allowed Origin URL:** `http://localhost:8585`
    - **Allowed Redirect URI:** `http://localhost:8585/callback`
-   - **API & Scopes:** Select "Vehicle Charging Management"
-3. Save your **Client ID** and **Client Secret**.
-4. Run the script and enter these credentials when prompted.
+   - **API & Scopes:** tick *Vehicle Charging Management*
+3. Note the **Client ID** and **Client Secret** Tesla shows you — you will enter them in Step 1.
+
+### Step 1 — First-time Tesla authentication
+
+Run the script once interactively so it can open a browser for Tesla's OAuth flow. From here on it caches and refreshes the tokens automatically.
+
+```sh
+source .venv/bin/activate
+python tesla_invoice_downloader.py --output-dir ~/tesla-invoices
+```
+
+The script will:
+
+1. Prompt for your Tesla **Client ID**, **Client Secret**, and region (NA/EU).
+2. Open Tesla's authorisation page in your browser.
+3. Catch the redirect on `http://localhost:8585/callback` and exchange the code for tokens.
+4. Download any existing invoices into `~/tesla-invoices/`.
+
+Tokens, region, and credentials are written to `~/.tesla_invoice_downloader.json` (chmod 0600). Subsequent runs are non-interactive.
+
+### Step 2 — Optional: configure Moneybird
+
+If you want each invoice uploaded automatically into the Moneybird Documenten inbox, generate a personal API token at <https://moneybird.com/user/applications/new> (tick the `documents` scope), then run:
+
+```sh
+python tesla_invoice_downloader.py --moneybird-setup
+```
+
+This prints the administrations available to your token, lets you pick one interactively, and saves the token + administration id into `~/.tesla_invoice_downloader.json`. Cron lines can now omit `--moneybird-token` / `--moneybird-admin-id` for that machine, or pass them explicitly when you want a single machine to serve multiple administrations.
+
+### Step 3 — Schedule with cron
+
+Find the absolute paths to the venv's Python interpreter and the script:
+
+```sh
+which python                       # absolute path to the venv's python
+realpath tesla_invoice_downloader.py   # absolute path to the script
+```
+
+Open your crontab:
+
+```sh
+crontab -e
+```
+
+Add one line per administration. Pick one of the two shapes:
+
+**Disk archive + Moneybird** — keeps PDFs on disk alongside the Moneybird upload:
+
+```cron
+0 8 * * * /Users/you/path/to/repo/.venv/bin/python /Users/you/path/to/repo/tesla_invoice_downloader.py --output-dir /Users/you/tesla-invoices --log-file /Users/you/tesla-invoices/cron.log
+```
+
+**Moneybird only** — no local files, requires Moneybird credentials in the config (Step 2) or on the cron line:
+
+```cron
+0 8 * * * /Users/you/path/to/repo/.venv/bin/python /Users/you/path/to/repo/tesla_invoice_downloader.py --log-file /Users/you/tesla-cron.log
+```
+
+Multiple Moneybird administrations — repeat the line, override credentials per cron entry:
+
+```cron
+0 8 * * * /Users/you/path/to/repo/.venv/bin/python /Users/you/path/to/repo/tesla_invoice_downloader.py --log-file /Users/you/tesla-cron-a.log --moneybird-token AAA --moneybird-admin-id 111
+5 8 * * * /Users/you/path/to/repo/.venv/bin/python /Users/you/path/to/repo/tesla_invoice_downloader.py --log-file /Users/you/tesla-cron-b.log --moneybird-token BBB --moneybird-admin-id 222
+```
+
+`0 8 * * *` runs at 08:00 every day. Adjust the minute/hour to taste.
+
+### Step 4 — Verify the cron job
+
+After the next scheduled run, inspect the log:
+
+```sh
+tail -n 50 ~/tesla-cron.log
+```
+
+You should see Tesla auth + `Total charging sessions retrieved: N`, and (if Moneybird is configured) `Uploaded session ... to Moneybird` lines for any new sessions. The first run after activation will quietly do nothing if you already downloaded the backlog manually in Step 1.
+
+### macOS notes
+
+On modern macOS, the user-level cron daemon needs Full Disk Access to write into protected directories (Desktop, Documents, Downloads, iCloud Drive). If your `--output-dir` or `--log-file` falls under one of those, grant `/usr/sbin/cron` Full Disk Access in **System Settings → Privacy & Security → Full Disk Access**. Writing into a plain folder in your home directory (e.g. `~/tesla-invoices/`) does not need it.
+
+## Moneybird upload (optional)
+
+When a Moneybird token and administration id are provided (either via CLI flags or via the config file), every downloaded invoice is also uploaded to Moneybird as a typeless document (Documenten inbox). The script uploads the PDF as an attachment with the Tesla `sessionId` as the document `reference`; Moneybird's OCR fills in supplier, amounts, currency and tax, and the bookkeeper converts it to a purchase invoice in the Moneybird UI with the correct contact. The script deliberately does not pick a contact or ledger account, because Tesla bills from different legal entities per region. (We use `typeless_documents` rather than `general_documents` because the latter auto-marks the document as paid.)
+
+### Streaming mode
+
+Omitting `--output-dir` switches the script into streaming mode: Tesla PDFs are fetched into memory and pushed straight to Moneybird, never touching the local filesystem. The `.json` metadata sidecar is also skipped. Streaming mode requires Moneybird credentials; running the script with no `--output-dir` and no Moneybird credentials exits with a clear error. Dedup still works (local `moneybird.uploaded.<admin_id>` map + Moneybird-side `reference` lookup), so re-runs are safe.
+
+### Idempotency
+
+The script tracks uploaded sessions per administration under `moneybird.uploaded.<admin_id>` in the config file, and additionally queries Moneybird for an existing document with the same `reference` before creating a new one. Re-running the script (or wiping local state) will not produce duplicate documents.
 
 ## File Naming Convention
 

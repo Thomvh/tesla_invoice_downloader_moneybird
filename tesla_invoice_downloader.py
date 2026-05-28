@@ -58,6 +58,7 @@ Dependencies:
     pip install requests
 """
 
+import io
 import os
 import sys
 import json
@@ -71,7 +72,7 @@ import requests
 import argparse
 import datetime
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Global configuration variables
 CONFIG_PATH: str = os.path.expanduser("~/.tesla_invoice_downloader.json")
@@ -200,6 +201,8 @@ def refreshAccessToken(refreshToken: str, clientId: str, region: str) -> Dict[st
 def makeRequest(method: str, url: str, headers: Dict[str, str],
                 params: Optional[Dict[str, Any]] = None,
                 data: Optional[Dict[str, Any]] = None,
+                json_body: Optional[Dict[str, Any]] = None,
+                files: Optional[Dict[str, Any]] = None,
                 retries: int = 3, backoffFactor: float = 1.0) -> requests.Response:
     """
     Make HTTP requests with exponential backoff in case of rate limiting (HTTP 429).
@@ -209,7 +212,7 @@ def makeRequest(method: str, url: str, headers: Dict[str, str],
             if method.upper() == "GET":
                 resp = requests.get(url, headers=headers, params=params)
             elif method.upper() == "POST":
-                resp = requests.post(url, headers=headers, data=data)
+                resp = requests.post(url, headers=headers, params=params, data=data, json=json_body, files=files)
             else:
                 raise ValueError("Unsupported HTTP method")
         except Exception as e:
@@ -487,6 +490,34 @@ class TeslaInvoiceDownloader:
         filename = f"{dateStr}.Tesla.Charging - {location} - {chargingUsage:.2f}kWh.{currencySymbol}{totalDue:.2f}.pdf"
         return safeFilename(filename)
 
+    def fetchInvoicePdfBytes(self, rec: Dict[str, Any]) -> Optional[Tuple[str, bytes]]:
+        """
+        Fetch the PDF for a charging record from the Tesla Fleet API and return
+        (filename, bytes). Returns None if the record has no invoice id or the call fails.
+        """
+        invoicesInfo = rec.get("invoices") or rec.get("Invoices")
+        if not invoicesInfo:
+            return None
+        inv = invoicesInfo[0]
+        invId = inv.get("contentId") or inv.get("id")
+        if not invId:
+            logger.warning("No invoice ID found for a record, skipping.")
+            return None
+        config = loadConfig()
+        baseUrl = getBaseUrlForRegion(config.get("region", "NA"))
+        invoiceUrl = f"{baseUrl}/api/1/dx/charging/invoice/{invId}"
+        logger.debug(f"Invoice URL: {invoiceUrl}")
+        try:
+            resp = makeRequest("GET", invoiceUrl, headers={"Authorization": f"Bearer {config.get('access_token')}"})
+        except Exception as e:
+            logger.error(f"Network error downloading invoice {invId}: {e}")
+            return None
+        logger.debug(f"Response status: {resp.status_code} Data: {resp.text[:200]}")
+        if resp.status_code != 200:
+            logger.error(f"Failed to download invoice {invId} (HTTP {resp.status_code}): {resp.text}")
+            return None
+        return self.getInvoiceFilename(rec), resp.content
+
     def downloadInvoices(self, records: List[Dict[str, Any]], vinFilter: Optional[str] = None, outputDir: str = ".", onOrAfter: Optional[str] = None) -> None:
         """
         Download PDF invoices for each record and save metadata.
@@ -515,36 +546,20 @@ class TeslaInvoiceDownloader:
                     logger.debug(f"Skipping record on {dateStr} because it is before {onOrAfter}")
                     continue
 
-            invoicesInfo = rec.get("invoices") or rec.get("Invoices")
-            if not invoicesInfo:
-                continue
-            inv = invoicesInfo[0]
-            invId = inv.get("contentId") or inv.get("id")
-            if not invId:
-                logger.warning("No invoice ID found for a record, skipping.")
-                continue
             fileName = self.getInvoiceFilename(rec)
             filePath = os.path.join(outputDir, fileName)
             if os.path.exists(filePath):
                 logger.info(f"Invoice {filePath} already exists. Skipping download.")
                 continue
-            config = loadConfig()
-            baseUrl = getBaseUrlForRegion(config.get("region", "NA"))
-            invoiceUrl = f"{baseUrl}/api/1/dx/charging/invoice/{invId}"
+
             logger.info(f"Downloading invoice PDF: {filePath}")
-            logger.debug(f"Invoice URL: {invoiceUrl}")
-            try:
-                resp = makeRequest("GET", invoiceUrl, headers={"Authorization": f"Bearer {config.get('access_token')}"})
-            except Exception as e:
-                logger.error(f"Network error downloading invoice {filePath}: {e}")
+            fetched = self.fetchInvoicePdfBytes(rec)
+            if fetched is None:
                 continue
-            logger.debug(f"Response status: {resp.status_code} Data: {resp.text[:200]}")
-            if resp.status_code != 200:
-                logger.error(f"Failed to download invoice {invId} (HTTP {resp.status_code}): {resp.text}")
-                continue
+            _, pdfBytes = fetched
             try:
                 with open(filePath, 'wb') as pdfFile:
-                    pdfFile.write(resp.content)
+                    pdfFile.write(pdfBytes)
                 logger.info(f"Saved invoice PDF: {filePath}")
             except Exception as e:
                 logger.error(f"Error saving PDF file {filePath}: {e}")
@@ -556,6 +571,320 @@ class TeslaInvoiceDownloader:
                 logger.info(f"Saved invoice metadata: {metaName}")
             except Exception as e:
                 logger.error(f"Error saving metadata file {metaName}: {e}")
+
+class MoneybirdUploader:
+    """
+    Uploads Tesla invoice PDFs to a Moneybird administration as typeless documents.
+
+    Strategy: create a minimal typeless_document (just `reference` = Tesla sessionId) and attach
+    the PDF. The PDF lands in Moneybird's Documenten inbox without being forced into a paid or
+    unpaid state; OCR/AI extracts supplier, amounts, currency and tax so the bookkeeper can
+    convert it to a purchase invoice in the UI with the correct contact. The purchase_invoices
+    endpoint is unsuitable because it requires `contact_id` and at least one line item, which
+    the script cannot reliably provide (Tesla bills from different legal entities per region).
+    The general_documents endpoint is unsuitable because it auto-marks the document as paid.
+    """
+
+    BASE_URL: str = "https://moneybird.com/api/v2"
+
+    def __init__(self, token: str, admin_id: str) -> None:
+        self.token: str = token
+        self.admin_id: str = admin_id
+
+    def _headers(self, accept_json: bool = True) -> Dict[str, str]:
+        h: Dict[str, str] = {"Authorization": f"Bearer {self.token}"}
+        if accept_json:
+            h["Accept"] = "application/json"
+        return h
+
+    def listAdministrations(self) -> List[Dict[str, Any]]:
+        url = f"{self.BASE_URL}/administrations.json"
+        resp = makeRequest("GET", url, self._headers())
+        if resp.status_code != 200:
+            raise Exception(f"Moneybird administrations list failed (HTTP {resp.status_code}): {resp.text}")
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    def findDocumentByReference(self, reference: str) -> Optional[str]:
+        url = f"{self.BASE_URL}/{self.admin_id}/documents/typeless_documents.json"
+        params: Dict[str, Any] = {"filter": f"reference:{reference}"}
+        resp = makeRequest("GET", url, self._headers(), params=params)
+        if resp.status_code != 200:
+            logger.warning(f"Moneybird lookup by reference failed (HTTP {resp.status_code}): {resp.text}")
+            return None
+        data = resp.json()
+        items = data if isinstance(data, list) else data.get("data", [])
+        for item in items:
+            if str(item.get("reference", "")) == str(reference):
+                return str(item.get("id"))
+        return None
+
+    def createTypelessDocument(self, rec: Dict[str, Any]) -> str:
+        body: Dict[str, Any] = {
+            "typeless_document": {
+                "reference": str(rec.get("sessionId", "")),
+            }
+        }
+        url = f"{self.BASE_URL}/{self.admin_id}/documents/typeless_documents.json"
+        resp = makeRequest("POST", url, self._headers(), json_body=body)
+        if resp.status_code not in (200, 201):
+            raise Exception(f"Moneybird create typeless document failed (HTTP {resp.status_code}): {resp.text}")
+        return str(resp.json().get("id"))
+
+    def attachPdf(self, document_id: str, filename: str, source: Union[str, bytes]) -> None:
+        """
+        Upload `source` (a filesystem path OR raw bytes) as a PDF attachment on the given
+        Moneybird typeless document. The `filename` is what Moneybird will show.
+        """
+        url = f"{self.BASE_URL}/{self.admin_id}/documents/typeless_documents/{document_id}/attachments.json"
+        if isinstance(source, (bytes, bytearray)):
+            buf = io.BytesIO(source)
+            files = {"file": (filename, buf, "application/pdf")}
+            resp = makeRequest("POST", url, self._headers(accept_json=False), files=files)
+        else:
+            with open(source, "rb") as fh:
+                files = {"file": (filename, fh, "application/pdf")}
+                resp = makeRequest("POST", url, self._headers(accept_json=False), files=files)
+        if resp.status_code not in (200, 201, 204):
+            raise Exception(f"Moneybird attach PDF failed (HTTP {resp.status_code}): {resp.text}")
+
+    def uploadInvoice(self, rec: Dict[str, Any], pdf_path: str) -> Optional[str]:
+        sessionId = str(rec.get("sessionId", ""))
+        if not sessionId:
+            logger.warning("Record has no sessionId, skipping Moneybird upload.")
+            return None
+
+        config = loadConfig()
+        moneybird = config.setdefault("moneybird", {})
+        uploaded = moneybird.setdefault("uploaded", {}).setdefault(self.admin_id, {})
+
+        if sessionId in uploaded:
+            logger.info(f"Session {sessionId} already uploaded to Moneybird admin {self.admin_id}. Skipping.")
+            return uploaded[sessionId].get("document_id") or uploaded[sessionId].get("invoice_id")
+
+        existing = self.findDocumentByReference(sessionId)
+        if existing:
+            logger.info(f"Session {sessionId} already exists in Moneybird (id {existing}); recording locally.")
+            uploaded[sessionId] = {
+                "document_id": existing,
+                "uploaded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            saveConfig(config)
+            return existing
+
+        logger.info(f"Creating Moneybird typeless document for session {sessionId}...")
+        document_id = self.createTypelessDocument(rec)
+        logger.info(f"Created Moneybird document id {document_id}; attaching PDF {pdf_path}...")
+        self.attachPdf(document_id, os.path.basename(pdf_path), pdf_path)
+        logger.info(f"Uploaded session {sessionId} to Moneybird (document id {document_id}).")
+
+        config = loadConfig()
+        moneybird = config.setdefault("moneybird", {})
+        uploaded = moneybird.setdefault("uploaded", {}).setdefault(self.admin_id, {})
+        uploaded[sessionId] = {
+            "document_id": document_id,
+            "uploaded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        saveConfig(config)
+        return document_id
+
+    def uploadDownloaded(self, records: List[Dict[str, Any]], outputDir: str,
+                         vinFilter: Optional[str] = None,
+                         onOrAfter: Optional[str] = None) -> None:
+        downloader = TeslaInvoiceDownloader(interactive=False)
+        for rec in records:
+            if vinFilter and rec.get("vin") != vinFilter:
+                continue
+            if onOrAfter:
+                chargeStart = rec.get("chargeStartDateTime")
+                if chargeStart:
+                    try:
+                        dt = datetime.datetime.fromisoformat(chargeStart)
+                        recDate = dt.strftime("%Y%m%d")
+                    except Exception:
+                        recDate = "00000000"
+                else:
+                    recDate = "00000000"
+                if recDate < onOrAfter:
+                    continue
+            fileName = downloader.getInvoiceFilename(rec)
+            pdfPath = os.path.join(outputDir, fileName)
+            if not os.path.exists(pdfPath):
+                logger.debug(f"PDF {pdfPath} not on disk, skipping Moneybird upload for this record.")
+                continue
+            try:
+                self.uploadInvoice(rec, pdfPath)
+            except Exception as e:
+                logger.error(f"Moneybird upload failed for session {rec.get('sessionId')}: {e}")
+
+    def uploadInvoiceDirect(self, rec: Dict[str, Any], downloader: "TeslaInvoiceDownloader") -> Optional[str]:
+        """
+        Streaming counterpart to uploadInvoice: fetches the PDF from Tesla in memory and
+        uploads directly to Moneybird without touching disk. The Tesla HTTP call is only
+        made when the session is genuinely new in Moneybird, so duplicates are free.
+        """
+        sessionId = str(rec.get("sessionId", ""))
+        if not sessionId:
+            logger.warning("Record has no sessionId, skipping Moneybird upload.")
+            return None
+
+        config = loadConfig()
+        moneybird = config.setdefault("moneybird", {})
+        uploaded = moneybird.setdefault("uploaded", {}).setdefault(self.admin_id, {})
+
+        if sessionId in uploaded:
+            logger.info(f"Session {sessionId} already uploaded to Moneybird admin {self.admin_id}. Skipping.")
+            return uploaded[sessionId].get("document_id") or uploaded[sessionId].get("invoice_id")
+
+        existing = self.findDocumentByReference(sessionId)
+        if existing:
+            logger.info(f"Session {sessionId} already exists in Moneybird (id {existing}); recording locally.")
+            uploaded[sessionId] = {
+                "document_id": existing,
+                "uploaded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            saveConfig(config)
+            return existing
+
+        logger.info(f"Fetching Tesla PDF for session {sessionId} (streaming, no local copy)...")
+        fetched = downloader.fetchInvoicePdfBytes(rec)
+        if fetched is None:
+            logger.error(f"Could not fetch Tesla PDF for session {sessionId}; skipping.")
+            return None
+        filename, pdfBytes = fetched
+
+        logger.info(f"Creating Moneybird typeless document for session {sessionId}...")
+        document_id = self.createTypelessDocument(rec)
+        logger.info(f"Created Moneybird document id {document_id}; streaming PDF ({len(pdfBytes)} bytes)...")
+        self.attachPdf(document_id, filename, pdfBytes)
+        logger.info(f"Uploaded session {sessionId} to Moneybird (document id {document_id}).")
+
+        config = loadConfig()
+        moneybird = config.setdefault("moneybird", {})
+        uploaded = moneybird.setdefault("uploaded", {}).setdefault(self.admin_id, {})
+        uploaded[sessionId] = {
+            "document_id": document_id,
+            "uploaded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        saveConfig(config)
+        return document_id
+
+    def streamRecords(self, records: List[Dict[str, Any]],
+                      vinFilter: Optional[str] = None,
+                      onOrAfter: Optional[str] = None) -> None:
+        """Iterate `records` and stream each one straight to Moneybird, no disk involved."""
+        downloader = TeslaInvoiceDownloader(interactive=False)
+        for rec in records:
+            if vinFilter and rec.get("vin") != vinFilter:
+                continue
+            if onOrAfter:
+                chargeStart = rec.get("chargeStartDateTime")
+                if chargeStart:
+                    try:
+                        dt = datetime.datetime.fromisoformat(chargeStart)
+                        recDate = dt.strftime("%Y%m%d")
+                    except Exception:
+                        recDate = "00000000"
+                else:
+                    recDate = "00000000"
+                if recDate < onOrAfter:
+                    continue
+            try:
+                self.uploadInvoiceDirect(rec, downloader)
+            except Exception as e:
+                logger.error(f"Moneybird streaming upload failed for session {rec.get('sessionId')}: {e}")
+
+
+def resolveMoneybirdConfig(args_ns: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Resolve Moneybird token + admin_id from CLI flags, falling back to the config defaults."""
+    defaults = config.get("moneybird", {}).get("defaults", {})
+    return {
+        "token": args_ns.moneybird_token or defaults.get("token"),
+        "admin_id": args_ns.moneybird_admin_id or defaults.get("admin_id"),
+    }
+
+
+def runMoneybirdListConfig(token: str) -> None:
+    if not token:
+        logger.error("--moneybird-list-config requires --moneybird-token.")
+        sys.exit(1)
+    uploader = MoneybirdUploader(token=token, admin_id="")
+    admins = uploader.listAdministrations()
+    if not admins:
+        print("No administrations available for this token.")
+        return
+    print("Moneybird administrations available to this token:")
+    for a in admins:
+        print(f"  id={a.get('id')}  name={a.get('name')}  currency={a.get('currency')}  country={a.get('country')}")
+
+
+def runMoneybirdSetup() -> None:
+    print("Interactive Moneybird setup. Token from https://moneybird.com/user/applications/new")
+    token = input("Moneybird API token: ").strip()
+    if not token:
+        logger.error("No token provided; aborting setup.")
+        sys.exit(1)
+    uploader = MoneybirdUploader(token=token, admin_id="")
+    try:
+        admins = uploader.listAdministrations()
+    except Exception as e:
+        logger.error(f"Could not list administrations with this token: {e}")
+        sys.exit(1)
+    if not admins:
+        logger.error("Token valid but no administrations are accessible. Aborting.")
+        sys.exit(1)
+    print("Pick an administration:")
+    for idx, a in enumerate(admins, start=1):
+        print(f"  [{idx}] id={a.get('id')}  name={a.get('name')}  currency={a.get('currency')}")
+    choice = input(f"Number [1-{len(admins)}]: ").strip()
+    try:
+        picked = admins[int(choice) - 1]
+    except (ValueError, IndexError):
+        logger.error("Invalid choice; aborting setup.")
+        sys.exit(1)
+
+    config = loadConfig()
+    moneybird = config.setdefault("moneybird", {})
+    defaults = moneybird.setdefault("defaults", {})
+    defaults["token"] = token
+    defaults["admin_id"] = str(picked.get("id"))
+    saveConfig(config)
+    print(f"Saved Moneybird defaults (admin_id={picked.get('id')}) to {CONFIG_PATH}.")
+
+
+def runMoneybirdUpload(records: List[Dict[str, Any]], args_ns: argparse.Namespace) -> bool:
+    """Disk-based upload: reads PDFs already written by downloadInvoices. Returns True on success."""
+    resolved = resolveMoneybirdConfig(args_ns, loadConfig())
+    token = resolved["token"]
+    admin_id = resolved["admin_id"]
+    if not token or not admin_id:
+        return True
+    try:
+        uploader = MoneybirdUploader(token=token, admin_id=admin_id)
+        uploader.uploadDownloaded(records, outputDir=args_ns.output_dir,
+                                  vinFilter=args_ns.vin, onOrAfter=args_ns.on_or_after)
+        return True
+    except Exception as e:
+        logger.error(f"Moneybird upload step failed: {e}")
+        return False
+
+
+def runMoneybirdStream(records: List[Dict[str, Any]], args_ns: argparse.Namespace) -> bool:
+    """Streaming upload: fetches Tesla PDFs in memory and pushes them straight to Moneybird."""
+    resolved = resolveMoneybirdConfig(args_ns, loadConfig())
+    token = resolved["token"]
+    admin_id = resolved["admin_id"]
+    if not token or not admin_id:
+        logger.error("Streaming mode requires Moneybird credentials but none are configured.")
+        return False
+    try:
+        uploader = MoneybirdUploader(token=token, admin_id=admin_id)
+        uploader.streamRecords(records, vinFilter=args_ns.vin, onOrAfter=args_ns.on_or_after)
+        return True
+    except Exception as e:
+        logger.error(f"Moneybird streaming step failed: {e}")
+        return False
+
 
 def main(args_in: argparse.Namespace) -> None:
     global args
@@ -571,6 +900,20 @@ def main(args_in: argparse.Namespace) -> None:
         logger.setLevel(logging.DEBUG)
         logger.debug("Debug mode enabled.")
 
+    if args.moneybird_setup:
+        runMoneybirdSetup()
+        return
+    if args.moneybird_list_config:
+        token = args.moneybird_token or loadConfig().get("moneybird", {}).get("defaults", {}).get("token")
+        runMoneybirdListConfig(token)
+        return
+
+    resolvedMb = resolveMoneybirdConfig(args, loadConfig())
+    streaming = args.output_dir is None
+    if streaming and not (resolvedMb["token"] and resolvedMb["admin_id"]):
+        logger.error("Either --output-dir or Moneybird credentials (--moneybird-token + --moneybird-admin-id, or saved defaults) are required.")
+        sys.exit(2)
+
     if args.daemon:
         logger.info("Daemonising process...")
         daemonize()
@@ -581,8 +924,11 @@ def main(args_in: argparse.Namespace) -> None:
             records = downloader.fetchChargingHistory(baseUrl, accessToken, vin=args.vin)
             if not records:
                 logger.error("Failed to retrieve charging history. Skipping this cycle.")
+            elif streaming:
+                runMoneybirdStream(records, args)
             else:
                 downloader.downloadInvoices(records, vinFilter=args.vin, outputDir=args.output_dir, onOrAfter=args.on_or_after)
+                runMoneybirdUpload(records, args)
             logger.info("Cycle complete. Sleeping for one hour...")
             time.sleep(3600)
     else:
@@ -593,17 +939,28 @@ def main(args_in: argparse.Namespace) -> None:
         if not records:
             logger.error("Failed to retrieve charging history. Exiting.")
             sys.exit(1)
-        downloader.downloadInvoices(records, vinFilter=args.vin, outputDir=args.output_dir, onOrAfter=args.on_or_after)
-        logger.info("Done. All available invoices have been downloaded.")
+        if streaming:
+            if not runMoneybirdStream(records, args):
+                sys.exit(1)
+            logger.info("Done. All available invoices have been streamed to Moneybird.")
+        else:
+            downloader.downloadInvoices(records, vinFilter=args.vin, outputDir=args.output_dir, onOrAfter=args.on_or_after)
+            logger.info("Done. All available invoices have been downloaded.")
+            if not runMoneybirdUpload(records, args):
+                sys.exit(1)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Tesla Invoice Downloader with HTTP Callback, Logging, and Daemonisation")
     parser.add_argument("--vin", help="Restrict to a particular VIN", default=None)
-    parser.add_argument("--output-dir", help="Directory to save invoice files", default=".")
+    parser.add_argument("--output-dir", help="Directory to save invoice files. If omitted, the script runs in streaming mode (requires Moneybird credentials) and writes nothing to disk.", default=None)
     parser.add_argument("--log-file", help="File to write logs to", default=None)
     parser.add_argument("--daemon", action="store_true", help="Daemonise the process to run in the background")
     parser.add_argument("--force-auth", action="store_true", help="Redo the authenication to get new tokens")
     parser.add_argument("--on-or-after", help="Only download invoices on or after this date (YYYYMMDD format)", default=None)
+    parser.add_argument("--moneybird-token", help="Moneybird personal API token. When set (here or in config), invoices are also uploaded into the Moneybird Documenten inbox as typeless documents.", default=None)
+    parser.add_argument("--moneybird-admin-id", help="Moneybird administration ID to upload into.", default=None)
+    parser.add_argument("--moneybird-list-config", action="store_true", help="List the administrations available to --moneybird-token, then exit.")
+    parser.add_argument("--moneybird-setup", action="store_true", help="Interactively save Moneybird token + admin id into the config file, then exit.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
     if args.on_or_after:
