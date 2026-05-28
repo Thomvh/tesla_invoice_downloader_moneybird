@@ -129,7 +129,98 @@ python tesla_invoice_downloader.py --moneybird-setup
 
 This prints the administrations available to your token, lets you pick one interactively, and saves the token + administration id into `~/.tesla_invoice_downloader.json`. Cron lines can now omit `--moneybird-token` / `--moneybird-admin-id` for that machine, or pass them explicitly when you want a single machine to serve multiple administrations.
 
-### Step 3 — Schedule with cron
+### Step 3 — Schedule daily runs
+
+Two equivalent options. **systemd timer** (Option A) is recommended on any modern Linux distribution: journal-based logging, native failure handling, easy on/off via `systemctl`. **cron** (Option B) is simpler and works everywhere; use it on macOS, BSDs, or if you just want a one-liner.
+
+Both call the script in one-shot mode. Don't combine either with `--daemon` — the daemon's internal hourly loop would duplicate the timer's scheduling.
+
+#### Option A — systemd timer (recommended for Linux servers)
+
+This shape assumes a dedicated unprivileged service user `tesla` with home at `/var/lib/tesla` (where `~/.tesla_invoice_downloader.json` will live) and the repo cloned into `/opt/tesla-moneybird`. Adjust the paths if your conventions differ.
+
+**Install code + venv as the service user:**
+
+```sh
+sudo useradd --system --home /var/lib/tesla --create-home --shell /usr/sbin/nologin tesla
+sudo git clone https://github.com/Thomvh/tesla_invoice_downloader_moneybird.git /opt/tesla-moneybird
+sudo chown -R tesla:tesla /opt/tesla-moneybird
+sudo -u tesla bash -c 'cd /opt/tesla-moneybird && python3 -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install requests'
+```
+
+**Seed the config interactively.** The Tesla OAuth flow needs a browser, which a headless server doesn't have. Easiest path: complete the OAuth flow on your workstation (Steps 1 + 2 above), then copy the resulting config file to the server:
+
+```sh
+scp ~/.tesla_invoice_downloader.json YOUR_SERVER:/tmp/tesla-config.json
+ssh YOUR_SERVER 'sudo install -o tesla -g tesla -m 600 /tmp/tesla-config.json /var/lib/tesla/.tesla_invoice_downloader.json && rm /tmp/tesla-config.json'
+```
+
+(Alternative: SSH-forward port 8585 from the server to your laptop with `ssh -L 8585:localhost:8585`, then run the OAuth flow on the server through the tunnel.)
+
+**Create the service unit** at `/etc/systemd/system/tesla-moneybird.service`:
+
+```ini
+[Unit]
+Description=Tesla invoice downloader to Moneybird Documenten
+Documentation=https://github.com/Thomvh/tesla_invoice_downloader_moneybird
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tesla
+Group=tesla
+WorkingDirectory=/opt/tesla-moneybird
+ExecStart=/opt/tesla-moneybird/.venv/bin/python /opt/tesla-moneybird/tesla_invoice_downloader.py
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tesla
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+```
+
+Notes on this unit:
+- `Type=oneshot` is correct because the script exits when done. systemd treats the run as "active" only while it's executing.
+- No `--log-file` is passed — the script logs to stderr by default, which systemd captures into the journal. View with `journalctl -u tesla-moneybird.service`.
+- `--output-dir` is intentionally omitted, putting the script in streaming mode (PDFs go straight to Moneybird, nothing written to disk). If you want a local archive, add `--output-dir /var/lib/tesla/invoices` to the `ExecStart` line (the `tesla` user already owns `/var/lib/tesla`, so no `ReadWritePaths` change is needed for a subdirectory of it).
+- `ProtectSystem=strict` makes the whole filesystem read-only; `ReadWritePaths=/var/lib/tesla` re-opens just the service user's home so the script can write its config + state file there. `ProtectHome=true` keeps the script away from other users' home directories under `/home` and `/root`.
+
+**Create the timer unit** at `/etc/systemd/system/tesla-moneybird.timer`:
+
+```ini
+[Unit]
+Description=Daily Tesla -> Moneybird run
+Requires=tesla-moneybird.service
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+`Persistent=true` makes systemd fire a missed run at next boot if the server was off at 08:00. `RandomizedDelaySec=15m` jitters the start so the request hits Moneybird at some point in the 08:00–08:15 window — good etiquette if many people use the same script.
+
+**Enable and start:**
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now tesla-moneybird.timer
+systemctl list-timers tesla-moneybird.timer    # confirm next firing
+```
+
+**Multiple Moneybird administrations:** copy the `.service` + `.timer` pair to `tesla-moneybird-b.service` / `tesla-moneybird-b.timer`, add `--moneybird-token BBB --moneybird-admin-id 222` to the `ExecStart` line of the new service, stagger the `OnCalendar=` time, enable. They share the same code and the same `tesla` user, but the local upload-state map in the config is keyed per admin id so they won't clash.
+
+#### Option B — cron (portable, simpler)
 
 Find the absolute paths to the venv's Python interpreter and the script:
 
@@ -167,9 +258,17 @@ Multiple Moneybird administrations — repeat the line, override credentials per
 
 `0 8 * * *` runs at 08:00 every day. Adjust the minute/hour to taste.
 
-### Step 4 — Verify the cron job
+### Step 4 — Verify the scheduled job
 
-After the next scheduled run, inspect the log:
+For systemd:
+
+```sh
+systemctl list-timers tesla-moneybird.timer    # next firing + last result
+journalctl -u tesla-moneybird.service -n 100   # recent run logs
+sudo systemctl start tesla-moneybird.service   # force a run now for testing
+```
+
+For cron:
 
 ```sh
 tail -n 50 ~/tesla-cron.log
